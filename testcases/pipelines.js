@@ -183,6 +183,54 @@ function generateTestCase(options) {
     });
 }
 
+function generateTimeseriesTestCase(options) {
+    var isView = true;  // Constant for use when calling populatorGenerator().
+    var nDocs = options.nDocs || 500;
+    var pipeline = options.pipeline;
+    var tags = options.tags || [];
+
+    var addSkipStage = options.addSkipStage;
+    if (addSkipStage === undefined) {
+        addSkipStage = true;
+    }
+
+    if (pipeline.length > 0 && addSkipStage) {
+        pipeline.push({$skip: 1e9});
+    }
+    tests.push({
+        tags: ['timeseries'],
+        name: "Timeseries." + options.name,
+        pre: (options.pre !== undefined)
+            ? options.pre(isView)
+            : function(sourceCollection) {
+              var db = sourceCollection.getDB();
+              db.adminCommand({setParameter: 1, featureFlagTimeseriesCollection: true});
+              var testDB = sourceCollection.getDB();
+              var collName = sourceCollection.getName();
+              sourceCollection.drop();
+              testDB.createCollection(collName, {timeseries: {timeField: "time", metaField: "meta"}});
+
+              var bulk = sourceCollection.initializeUnorderedBulkOp();
+              for (var i = 0; i < 10000; i++) {
+                  bulk.insert(options.docGenerator(i));
+              }
+              bulk.execute();
+            },
+        post: options.post ||
+            function(view) {
+                var collection = view.getDB()[view.getName()];
+                view.drop();
+                collection.drop();
+            },
+        ops: [{
+            op: "command",
+            ns: "#B_DB",
+            command: {aggregate: "#B_COLL", pipeline: pipeline, cursor: {}}
+        }]
+    });
+
+
+}
 //
 // Empty pipeline.
 //
@@ -1567,5 +1615,153 @@ generateTestCase({
             }
         }
     }]
+});
+
+function pushdownDocGenerator(uid) {
+    Random.srand(341215145);
+    return function(i) {
+        return {
+		_id: new ObjectId(),
+		uid: uid,
+		amount: Random.randInt(1000000),
+		status: i
+        };
+    };
+}
+
+generateTestCase({
+    name: "EmitJs.AggOnly",
+    tags: ['js', '>=4.3.4'],
+    nDocs: 200000,
+    docGenerator: pushdownDocGenerator("foo"),
+    pipeline: [{
+        $project: {
+            "emits" : {
+                "$_internalJsEmit" : {
+		    "eval" : "function() { emit( this.uid, this.amount ); }",
+	            "this" : "$$ROOT"
+		}
+	    },
+            "_id": false
+	}},
+	{$count: "n"},
+    ]});
+
+generateTimeseriesTestCase({
+    name: "SingleBucketSingleColWithMeta",
+    tags: ['timeseries'],
+    docGenerator: function(i) {
+        return {
+            _id: i,
+            time: ISODate(),
+            meta: {x: 1, y: 2},
+            a: i
+        };
+    },
+    pipeline: [
+        {
+          $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+          }
+        }
+    ],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucketTwoColsWithMeta",
+    tags: ['timeseries'],
+    docGenerator: function(i) {
+        return {
+            _id: i,
+            time: ISODate(),
+            meta: {x: 1, y: 2},
+            a: i,
+            b: i
+        };
+    },
+    pipeline: [
+        {
+          $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+          }
+        }
+    ],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucketTwoColsWithoutMeta",
+    tags: ['timeseries'],
+    docGenerator: function(i) {
+        return {
+            _id: i,
+            time: ISODate(),
+            meta: {x: 1, y: 2},
+            a: i,
+            b: i
+        };
+    },
+    pipeline: [
+        {
+          $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+          }
+        }
+    ],
+});
+
+
+generateTimeseriesTestCase({
+    name: "SingleBucketFourColsWithMeta",
+    tags: ['timeseries'],
+    docGenerator: function(i) {
+        return {
+            _id: i,
+            time: ISODate(),
+            meta: {x: 1, y: 2},
+            a: i,
+            b: i + 1,
+            c: i + 2,
+            d: i + 3
+        };
+    },
+    pipeline: [
+        {
+          $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+          }
+        }
+    ],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucketIncludeTwoColsWithMeta",
+    tags: ['timeseries'],
+    docGenerator: function(i) {
+        return {
+            _id: i,
+            time: ISODate(),
+            meta: {x: 1, y: 2},
+            a: i,
+            b: i + 1,
+            c: i + 2,
+            d: i + 3
+        };
+    },
+    pipeline: [
+        {
+          $_internalUnpackBucket: {
+            include: ['a', 'b'],
+            timeField: 'time',
+            metaField: 'meta',
+          }
+        }
+    ],
 });
 })();
