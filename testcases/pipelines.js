@@ -189,7 +189,7 @@ function generateTimeseriesTestCase(options) {
     var pipeline = options.pipeline;
     var tags = options.tags || [];
 
-    var tagsForTest = ["timeseries"].concat(tags);
+    var tagsForTest = ["regression", "timeseries"].concat(tags);
 
     var addSkipStage = options.addSkipStage;
     if (addSkipStage === undefined) {
