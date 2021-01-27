@@ -2,7 +2,7 @@ function prepOp(collection, op) {
 
     function fixString(str) {
         if (str.startsWith("#B_COLL")) {
-            return str.replace("#B_COLL", "system.buckets."+collection.getName());
+            return str.replace("#B_COLL", collection.getName());
         }
         else if (str.startsWith("#B_NS")) {
             return str.replace("#B_NS", collection.getFullName());

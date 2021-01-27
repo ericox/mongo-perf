@@ -2,7 +2,7 @@ if (typeof (tests) != "object") {
     tests = [];
 }
 
-(function () {
+(function() {
 'use strict';
 
 /**
@@ -184,10 +184,12 @@ function generateTestCase(options) {
 }
 
 function generateTimeseriesTestCase(options) {
-    var isView = true;  // Constant for use when calling populatorGenerator().
+    var isView = false;  // Constant for use when calling populatorGenerator().
     var nDocs = options.nDocs || 500;
     var pipeline = options.pipeline;
     var tags = options.tags || [];
+
+    var tagsForTest = ["timeseries"].concat(tags);
 
     var addSkipStage = options.addSkipStage;
     if (addSkipStage === undefined) {
@@ -197,29 +199,18 @@ function generateTimeseriesTestCase(options) {
     if (pipeline.length > 0 && addSkipStage) {
         pipeline.push({$skip: 1e9});
     }
+
     tests.push({
-        tags: ['timeseries'],
+        tags: tagsForTest,
         name: "Timeseries." + options.name,
         pre: (options.pre !== undefined)
             ? options.pre(isView)
-            : function(sourceCollection) {
-              var db = sourceCollection.getDB();
-              db.adminCommand({setParameter: 1, featureFlagTimeseriesCollection: true});
-              var testDB = sourceCollection.getDB();
-              var collName = sourceCollection.getName();
-              sourceCollection.drop();
-              testDB.createCollection(collName, {timeseries: {timeField: "time", metaField: "meta"}});
-
-              var bulk = sourceCollection.initializeUnorderedBulkOp();
-              for (var i = 0; i < 10000; i++) {
-                  bulk.insert(options.docGenerator(i));
-              }
-              bulk.execute();
-            },
+            : populatorGenerator(isView,
+                                 nDocs,
+                                 options.indices || [],
+                                 options.docGenerator || defaultDocGenerator),
         post: options.post ||
-            function(view) {
-                var collection = view.getDB()[view.getName()];
-                view.drop();
+            function(collection) {
                 collection.drop();
             },
         ops: [{
@@ -228,9 +219,8 @@ function generateTimeseriesTestCase(options) {
             command: {aggregate: "#B_COLL", pipeline: pipeline, cursor: {}}
         }]
     });
-
-
 }
+
 //
 // Empty pipeline.
 //
@@ -1620,12 +1610,7 @@ generateTestCase({
 function pushdownDocGenerator(uid) {
     Random.srand(341215145);
     return function(i) {
-        return {
-		_id: new ObjectId(),
-		uid: uid,
-		amount: Random.randInt(1000000),
-		status: i
-        };
+        return {_id: new ObjectId(), uid: uid, amount: Random.randInt(1000000), status: i};
     };
 }
 
@@ -1634,134 +1619,599 @@ generateTestCase({
     tags: ['js', '>=4.3.4'],
     nDocs: 200000,
     docGenerator: pushdownDocGenerator("foo"),
+    pipeline: [
+        {
+            $project: {
+                "emits": {
+                    "$_internalJsEmit":
+                        {"eval": "function() { emit( this.uid, this.amount ); }", "this": "$$ROOT"}
+                },
+                "_id": false
+            }
+        },
+        {$count: "n"},
+    ]
+});
+
+function timeseriesBucketGenerator(nMeasurements, columns, timeField, metadata) {
+    return function(i) {
+        var data = {};
+        var timestamps = {};
+        for (var i = 0; i < nMeasurements; i++) {
+            timestamps[i.toString()] = ISODate();
+        }
+        data[timeField] = timestamps;
+
+        var idx = 0;
+        for (var j = 0; j < columns.length; j++) {
+            data[columns[j]] = {};
+            for (var k = 0; k < nMeasurements; k++) {
+                data[columns[j]][k.toString()] = Random.randInt(100);
+            }
+        }
+        var doc = {_id: new ObjectId(), control: {}, data: data};
+        if (metadata) {
+            doc.meta = metadata;
+        }
+        return doc;
+    };
+}
+
+generateTimeseriesTestCase({
+    name: "SingleBucket2MeasurmentsWithSingleColAndMeta",
+    tags: ['unpackBucketDepth'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(2, ["a"], "time", {a: 1, b: 2}),
     pipeline: [{
-        $project: {
-            "emits" : {
-                "$_internalJsEmit" : {
-		    "eval" : "function() { emit( this.uid, this.amount ); }",
-	            "this" : "$$ROOT"
-		}
-	    },
-            "_id": false
-	}},
-	{$count: "n"},
-    ]});
-
-generateTimeseriesTestCase({
-    name: "SingleBucketSingleColWithMeta",
-    tags: ['timeseries'],
-    docGenerator: function(i) {
-        return {
-            _id: i,
-            time: ISODate(),
-            meta: {x: 1, y: 2},
-            a: i
-        };
-    },
-    pipeline: [
-        {
-          $_internalUnpackBucket: {
+        $_internalUnpackBucket: {
             exclude: [],
             timeField: 'time',
             metaField: 'meta',
-          }
         }
-    ],
+    }],
 });
 
 generateTimeseriesTestCase({
-    name: "SingleBucketTwoColsWithMeta",
-    tags: ['timeseries'],
-    docGenerator: function(i) {
-        return {
-            _id: i,
-            time: ISODate(),
-            meta: {x: 1, y: 2},
-            a: i,
-            b: i
-        };
-    },
-    pipeline: [
-        {
-          $_internalUnpackBucket: {
+    name: "SingleBucket4MeasurmentsWithSingleColAndMeta",
+    tags: ['unpackBucketDepth'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(4, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
             exclude: [],
             timeField: 'time',
             metaField: 'meta',
-          }
         }
-    ],
+    }],
 });
 
 generateTimeseriesTestCase({
-    name: "SingleBucketTwoColsWithoutMeta",
-    tags: ['timeseries'],
-    docGenerator: function(i) {
-        return {
-            _id: i,
-            time: ISODate(),
-            meta: {x: 1, y: 2},
-            a: i,
-            b: i
-        };
-    },
-    pipeline: [
-        {
-          $_internalUnpackBucket: {
-            exclude: [],
-            timeField: 'time',
-          }
-        }
-    ],
-});
-
-
-generateTimeseriesTestCase({
-    name: "SingleBucketFourColsWithMeta",
-    tags: ['timeseries'],
-    docGenerator: function(i) {
-        return {
-            _id: i,
-            time: ISODate(),
-            meta: {x: 1, y: 2},
-            a: i,
-            b: i + 1,
-            c: i + 2,
-            d: i + 3
-        };
-    },
-    pipeline: [
-        {
-          $_internalUnpackBucket: {
+    name: "SingleBucket8MeasurmentsWithSingleColAndMeta",
+    tags: ['unpackBucketDepth'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(8, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
             exclude: [],
             timeField: 'time',
             metaField: 'meta',
-          }
         }
-    ],
+    }],
 });
 
 generateTimeseriesTestCase({
-    name: "SingleBucketIncludeTwoColsWithMeta",
-    tags: ['timeseries'],
-    docGenerator: function(i) {
-        return {
-            _id: i,
-            time: ISODate(),
-            meta: {x: 1, y: 2},
-            a: i,
-            b: i + 1,
-            c: i + 2,
-            d: i + 3
-        };
-    },
-    pipeline: [
-        {
-          $_internalUnpackBucket: {
-            include: ['a', 'b'],
+    name: "SingleBucket16MeasurmentsWithSingleColAndMeta",
+    tags: ['unpackBucketDepth'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(16, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
             timeField: 'time',
             metaField: 'meta',
-          }
         }
-    ],
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket32MeasurmentsWithSingleColAndMeta",
+    tags: ['unpackBucketDepth'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(32, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket64MeasurmentsWithSingleColAndMeta",
+    tags: ['unpackBucketDepth'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(64, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket128MeasurmentsWithSingleColAndMeta",
+    tags: ['unpackBucketDepth'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(128, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket256MeasurmentsWithSingleColAndMeta",
+    tags: ['unpackBucketDepth'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(256, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket512MeasurmentsWithSingleColAndMeta",
+    tags: ['unpackBucketDepth'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(512, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket1024MeasurmentsWithSingleColAndMeta",
+    tags: ['unpackBucketDepth'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(512, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "MultipleBucket1SingleColWithMeta",
+    tags: ['unpackBucketReset'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(100, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "MultipleBucket2SingleColWithMeta",
+    tags: ['unpackBucketReset'],
+    nDocs: 2,
+    docGenerator: timeseriesBucketGenerator(100, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "MultipleBucket4SingleColWithMeta",
+    tags: ['unpackBucketReset'],
+    nDocs: 4,
+    docGenerator: timeseriesBucketGenerator(100, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "MultipleBucket8SingleColWithMeta",
+    tags: ['unpackBucketReset'],
+    nDocs: 8,
+    docGenerator: timeseriesBucketGenerator(100, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "MultipleBucket16SingleColWithMeta",
+    tags: ['unpackBucketReset'],
+    nDocs: 16,
+    docGenerator: timeseriesBucketGenerator(100, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "MultipleBucket32SingleColWithMeta",
+    tags: ['unpackBucketReset'],
+    nDocs: 32,
+    docGenerator: timeseriesBucketGenerator(100, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "MultipleBucket64SingleColWithMeta",
+    tags: ['unpackBucketReset'],
+    nDocs: 64,
+    docGenerator: timeseriesBucketGenerator(100, ["a"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket100Measurments2Columns",
+    tags: ['unpackBucketColumns'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(100, ["a", "b"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket100Measurments4Columns",
+    tags: ['unpackBucketColumns'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(100, ["a", "b", "c", "d"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket100Measurments8Columns",
+    tags: ['unpackBucketColumns'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(
+        100, ["a", "b", "c", "d", "e", "f", "g", "h"], "time", {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket100Measurments16Columns",
+    tags: ['unpackBucketColumns'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(
+        100,
+        ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p"],
+        "time",
+        {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket100Measurments32Columns",
+    tags: ['unpackBucketColumns'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(
+        100,
+        [
+            "a",  "b",  "c",  "d",  "e",  "f",  "g",  "h",  "i",  "j",  "k",
+            "l",  "m",  "n",  "o",  "p",  "aa", "bb", "cc", "dd", "ee", "ff",
+            "gg", "hh", "ii", "jj", "kk", "ll", "mm", "nn", "oo", "pp"
+        ],
+        "time",
+        {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket100Measurments32ColumnsProject2Contiguious",
+    tags: ['unpackBucketProject'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(
+        100,
+        [
+            "a",  "b",  "c",  "d",  "e",  "f",  "g",  "h",  "i",  "j",  "k",
+            "l",  "m",  "n",  "o",  "p",  "aa", "bb", "cc", "dd", "ee", "ff",
+            "gg", "hh", "ii", "jj", "kk", "ll", "mm", "nn", "oo", "pp"
+        ],
+        "time",
+        {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            include: ["a", "b"],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket100Measurments32ColumnsProject2AtEnds",
+    tags: ['unpackBucketProject'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(
+        100,
+        [
+            "a",  "b",  "c",  "d",  "e",  "f",  "g",  "h",  "i",  "j",  "k",
+            "l",  "m",  "n",  "o",  "p",  "aa", "bb", "cc", "dd", "ee", "ff",
+            "gg", "hh", "ii", "jj", "kk", "ll", "mm", "nn", "oo", "pp"
+        ],
+        "time",
+        {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            include: ["a", "pp"],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket100Measurments32ColumnsProject4Contig",
+    tags: ['unpackBucketProject'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(
+        100,
+        [
+            "a",  "b",  "c",  "d",  "e",  "f",  "g",  "h",  "i",  "j",  "k",
+            "l",  "m",  "n",  "o",  "p",  "aa", "bb", "cc", "dd", "ee", "ff",
+            "gg", "hh", "ii", "jj", "kk", "ll", "mm", "nn", "oo", "pp"
+        ],
+        "time",
+        {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            include: ["a", "b", "c", "d"],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket100Measurments32ColumnsProject4Spread",
+    tags: ['unpackBucketProject'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(
+        100,
+        [
+            "a",  "b",  "c",  "d",  "e",  "f",  "g",  "h",  "i",  "j",  "k",
+            "l",  "m",  "n",  "o",  "p",  "aa", "bb", "cc", "dd", "ee", "ff",
+            "gg", "hh", "ii", "jj", "kk", "ll", "mm", "nn", "oo", "pp"
+        ],
+        "time",
+        {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            include: ["a", "aa", "hh", "pp"],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket100Measurments32ColumnsProject8Contig",
+    tags: ['unpackBucketProject'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(
+        100,
+        [
+            "a",  "b",  "c",  "d",  "e",  "f",  "g",  "h",  "i",  "j",  "k",
+            "l",  "m",  "n",  "o",  "p",  "aa", "bb", "cc", "dd", "ee", "ff",
+            "gg", "hh", "ii", "jj", "kk", "ll", "mm", "nn", "oo", "pp"
+        ],
+        "time",
+        {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            include: ["a", "b", "c", "d", "e", "f", "g", "h"],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket100Measurments32ColumnsProject8Spread",
+    tags: ['unpackBucketProject'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(
+        100,
+        [
+            "a",  "b",  "c",  "d",  "e",  "f",  "g",  "h",  "i",  "j",  "k",
+            "l",  "m",  "n",  "o",  "p",  "aa", "bb", "cc", "dd", "ee", "ff",
+            "gg", "hh", "ii", "jj", "kk", "ll", "mm", "nn", "oo", "pp"
+        ],
+        "time",
+        {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            include: ["a", "e", "i", "m", "aa", "ee", "ii", "mm"],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket100Measurments32Columns2MetaFields",
+    tags: ['unpackBucketMeta'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(
+        100,
+        [
+            "a",  "b",  "c",  "d",  "e",  "f",  "g",  "h",  "i",  "j",  "k",
+            "l",  "m",  "n",  "o",  "p",  "aa", "bb", "cc", "dd", "ee", "ff",
+            "gg", "hh", "ii", "jj", "kk", "ll", "mm", "nn", "oo", "pp"
+        ],
+        "time",
+        {a: 1, b: 2}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket100Measurments32Columns4MetaFields",
+    tags: ['unpackBucketMeta'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(
+        100,
+        [
+            "a",  "b",  "c",  "d",  "e",  "f",  "g",  "h",  "i",  "j",  "k",
+            "l",  "m",  "n",  "o",  "p",  "aa", "bb", "cc", "dd", "ee", "ff",
+            "gg", "hh", "ii", "jj", "kk", "ll", "mm", "nn", "oo", "pp"
+        ],
+        "time",
+        {a: 1, b: 2, c: 3, d: 4}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket100Measurments32Columns8MetaFields",
+    tags: ['unpackBucketMeta'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(
+        100,
+        [
+            "a",  "b",  "c",  "d",  "e",  "f",  "g",  "h",  "i",  "j",  "k",
+            "l",  "m",  "n",  "o",  "p",  "aa", "bb", "cc", "dd", "ee", "ff",
+            "gg", "hh", "ii", "jj", "kk", "ll", "mm", "nn", "oo", "pp"
+        ],
+        "time",
+        {a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8}),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
+});
+
+generateTimeseriesTestCase({
+    name: "SingleBucket100Measurments32Columns16MetaFields",
+    tags: ['unpackBucketMeta'],
+    nDocs: 1,
+    docGenerator: timeseriesBucketGenerator(
+        100,
+        [
+            "a",  "b",  "c",  "d",  "e",  "f",  "g",  "h",  "i",  "j",  "k",
+            "l",  "m",  "n",  "o",  "p",  "aa", "bb", "cc", "dd", "ee", "ff",
+            "gg", "hh", "ii", "jj", "kk", "ll", "mm", "nn", "oo", "pp"
+        ],
+        "time",
+        {
+            a: 1,
+            b: 2,
+            c: 3,
+            d: 4,
+            e: 5,
+            f: 6,
+            g: 7,
+            h: 8,
+            aa: 1,
+            bb: 2,
+            cc: 3,
+            dd: 4,
+            ee: 5,
+            ff: 6,
+            gg: 7,
+            hh: 8
+        }),
+    pipeline: [{
+        $_internalUnpackBucket: {
+            exclude: [],
+            timeField: 'time',
+            metaField: 'meta',
+        }
+    }],
 });
 })();
